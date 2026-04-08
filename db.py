@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gtt_signals.db")
+from settings import DB_PATH
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -59,10 +59,6 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE INDEX IF NOT EXISTS idx_signals_instrument_key ON signals (instrument_key);
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals (status);
-CREATE INDEX IF NOT EXISTS idx_signals_gtt_order_id ON signals (gtt_order_id);
-CREATE INDEX IF NOT EXISTS idx_signals_entry_order_id ON signals (entry_order_id);
-CREATE INDEX IF NOT EXISTS idx_signals_target_order_id ON signals (target_order_id);
-CREATE INDEX IF NOT EXISTS idx_signals_stoploss_order_id ON signals (stoploss_order_id);
 
 CREATE TABLE IF NOT EXISTS price_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,6 +80,14 @@ CREATE TABLE IF NOT EXISTS gtt_status_checks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_gtt_status_signal_id ON gtt_status_checks (signal_id);
+"""
+
+
+POST_MIGRATION_DDL = """
+CREATE INDEX IF NOT EXISTS idx_signals_gtt_order_id ON signals (gtt_order_id);
+CREATE INDEX IF NOT EXISTS idx_signals_entry_order_id ON signals (entry_order_id);
+CREATE INDEX IF NOT EXISTS idx_signals_target_order_id ON signals (target_order_id);
+CREATE INDEX IF NOT EXISTS idx_signals_stoploss_order_id ON signals (stoploss_order_id);
 
 CREATE TABLE IF NOT EXISTS gtt_rules (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,6 +203,7 @@ def init_db():
     with _conn() as con:
         con.executescript(DDL)
         _run_migrations(con)
+        con.executescript(POST_MIGRATION_DDL)
 
 
 def _now_iso() -> str:
@@ -659,4 +664,3 @@ def update_tracker_fields(
     vals.append(signal_id)
     with _conn() as con:
         con.execute(f"UPDATE signals SET {', '.join(sets)} WHERE id=?", vals)
-

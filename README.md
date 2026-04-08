@@ -80,6 +80,16 @@ Shell wrapper:
 ./run.sh
 ```
 
+## AWS
+
+The repo is now prepared for single-host AWS deployment with Docker:
+
+- `Dockerfile`
+- `docker-compose.aws.yml`
+- `AWS_DEPLOYMENT.md`
+
+Recommended target: a static-IP Lightsail or EC2 instance so Upstox order APIs can be whitelisted correctly.
+
 ## Logs
 
 Logs are written under `logs/`:

@@ -15,6 +15,7 @@ from telethon import TelegramClient, events
 
 from entity_finder import resolve_entity
 from ParseerWithAI.ai_signal_parser import AISignalParser
+from settings import LOG_DIR, TELEGRAM_SESSION_PATH
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -32,15 +33,12 @@ REDIS_STREAM_KEY = os.getenv("REDIS_STREAM_KEY", os.getenv("REDIS_STREAM_NAME", 
 OPENALGO_WEBHOOK_URL = os.getenv("OPENALGO_WEBHOOK_URL", "")
 OPENALGO_API_KEY = os.getenv("OPENALGO_API_KEY", "")
 
-_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(_log_dir, exist_ok=True)
-
 logger = logging.getLogger("telegram_ai_listener")
 if not logger.handlers:
     _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     _ch = logging.StreamHandler()
     _ch.setFormatter(_fmt)
-    _fh = logging.FileHandler(os.path.join(_log_dir, "telegram_ai_listener.log"))
+    _fh = logging.FileHandler(LOG_DIR / "telegram_ai_listener.log")
     _fh.setFormatter(_fmt)
     logger.addHandler(_ch)
     logger.addHandler(_fh)
@@ -77,8 +75,7 @@ async def main():
     if not r:
         return
 
-    session_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_name")
-    client = TelegramClient(session_path, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    client = TelegramClient(str(TELEGRAM_SESSION_PATH), TELEGRAM_API_ID, TELEGRAM_API_HASH)
     try:
         await client.start(phone=TELEGRAM_PHONE)
         logger.info("✅ Telegram client connected")

@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
 
 import db
+from settings import LOG_DIR
 
 # Load .env from same directory as this script
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -36,13 +37,10 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 PRINT_DEBUG = True
 
 # Logger setup
-_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-os.makedirs(_log_dir, exist_ok=True)
-
 logger = logging.getLogger("gtt_upstox")
 if not logger.handlers:
     _handler = logging.StreamHandler()
-    _handler_file = logging.FileHandler(os.path.join(_log_dir, "gtt_upstox.log"))
+    _handler_file = logging.FileHandler(LOG_DIR / "gtt_upstox.log")
     _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     _handler.setFormatter(_formatter)
     _handler_file.setFormatter(_formatter)

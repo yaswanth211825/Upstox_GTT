@@ -19,6 +19,7 @@ import websockets
 from dotenv import load_dotenv
 
 import db
+from settings import LOG_DIR
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -26,15 +27,12 @@ UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
 UPSTOX_BASE_URL = os.getenv("UPSTOX_BASE_URL", "https://api.upstox.com")
 TRACKER_RECONCILE_INTERVAL = int(os.getenv("TRACKER_RECONCILE_INTERVAL", "120"))
 
-_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(_log_dir, exist_ok=True)
-
 logger = logging.getLogger("upstox_order_tracker")
 if not logger.handlers:
     _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     _ch = logging.StreamHandler()
     _ch.setFormatter(_fmt)
-    _fh = logging.FileHandler(os.path.join(_log_dir, "upstox_order_tracker.log"))
+    _fh = logging.FileHandler(LOG_DIR / "upstox_order_tracker.log")
     _fh.setFormatter(_fmt)
     logger.addHandler(_ch)
     logger.addHandler(_fh)

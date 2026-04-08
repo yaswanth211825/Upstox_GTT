@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      APP_DATA_DIR: /app/data
+      APP_LOG_DIR: /app/data/logs
+      APP_DB_PATH: /app/data/gtt_signals.db
+      TELEGRAM_SESSION_PATH: /app/data/session_name
+    volumes:
+      - ./data:/app/data
+    command: ["python", "app.py"]

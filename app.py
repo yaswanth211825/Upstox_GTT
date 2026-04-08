@@ -9,9 +9,11 @@ import sys
 import time
 from pathlib import Path
 
+from settings import DATA_DIR, PYTHON_BIN as CONFIGURED_PYTHON_BIN
 
 ROOT = Path(__file__).resolve().parent
-PYTHON = str(ROOT / ".venv" / "bin" / "python")
+PYTHON = CONFIGURED_PYTHON_BIN or sys.executable
+PID_FILE = DATA_DIR / "app.pid"
 
 SERVICES = [
     ("telegram_ai_listener", ["telegram_ai_listener.py"]),
@@ -31,9 +33,13 @@ def main() -> int:
     if not Path(PYTHON).exists():
         print(f"Virtualenv python not found: {PYTHON}", file=sys.stderr)
         return 1
+    if PID_FILE.exists():
+        print(f"PID lock exists at {PID_FILE}. Stop the old app instance first.", file=sys.stderr)
+        return 1
 
     processes: list[tuple[str, subprocess.Popen]] = []
     stopping = False
+    PID_FILE.write_text(str(os.getpid()))
 
     def _shutdown(signum=None, frame=None):
         nonlocal stopping
@@ -52,6 +58,10 @@ def main() -> int:
                     proc.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
