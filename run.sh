@@ -1,5 +1,5 @@
 #!/bin/bash
-# run.sh — Start gtt_strategy + price_monitor together
+# run.sh — Start gtt_strategy + upstox_order_tracker together
 # Usage: ./run.sh
 # Stop: Ctrl+C
 
@@ -11,11 +11,11 @@ echo "Starting UpstoxGTT..."
 .venv/bin/python gtt_strategy.py &
 PID1=$!
 
-.venv/bin/python price_monitor.py &
+.venv/bin/python upstox_order_tracker.py &
 PID2=$!
 
 echo "gtt_strategy  PID: $PID1"
-echo "price_monitor PID: $PID2"
+echo "upstox_order_tracker PID: $PID2"
 echo "Press Ctrl+C to stop both."
 
 # On Ctrl+C, kill both

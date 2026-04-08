@@ -545,6 +545,7 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
                 gtt_ids = result.get("data", {}).get("gtt_order_ids", [])
                 logger.info(f"✅ GTT Order placed successfully! IDs: {gtt_ids}")
                 result["instrument_token"] = instrument_token
+                result["request_payload"] = payload
                 ltp = fetch_ltp(instrument_token)
                 result["ltp_at_placement"] = ltp
                 if ltp:
@@ -599,6 +600,7 @@ def store_signal_metadata(
     gtt_ids: Optional[List[str]] = None,
     instrument_key: str = "",
     ltp_at_placement: Optional[float] = None,
+    gtt_request_payload: Optional[Dict[str, Any]] = None,
 ):
     """Store metadata about processed GTT signal in Redis and SQLite DB"""
     try:
@@ -625,7 +627,7 @@ def store_signal_metadata(
     if signal and signal.get("entry_low"):
         try:
             db_status = "PENDING" if status == "success" else "FAILED"
-            db.insert_signal(
+            signal_id = db.insert_signal(
                 redis_message_id=message_id,
                 signal=signal,
                 instrument_key=instrument_key,
@@ -634,6 +636,18 @@ def store_signal_metadata(
                 notes=None if status == "success" else status,
                 ltp_at_placement=ltp_at_placement,
             )
+            if signal_id and gtt_ids:
+                for gtt_id in gtt_ids:
+                    db.set_signal_gtt_order(signal_id, gtt_id)
+                    if gtt_request_payload:
+                        for rule in gtt_request_payload.get("rules", []):
+                            seeded_rule = dict(rule)
+                            seeded_rule.setdefault("status", "PENDING")
+                            seeded_rule.setdefault("message", "")
+                            seeded_rule.setdefault("order_id", None)
+                            seeded_rule.setdefault("transaction_type", gtt_request_payload.get("transaction_type"))
+                            db.upsert_gtt_rule(signal_id, gtt_id, seeded_rule)
+                db.update_tracker_fields(signal_id, tracker_status="GTT_PLACED")
             if PRINT_DEBUG:
                 logger.debug(f"📝 Stored DB record for {message_id} ({db_status})")
         except Exception as e:
@@ -718,7 +732,15 @@ def start_stream_consumer():
                     gtt_ids = None
                     if result.get("status") == "success":
                         gtt_ids = result.get("data", {}).get("gtt_order_ids")
-                        store_signal_metadata(message_id, signal, "success", gtt_ids, instrument_key=result.get("instrument_token", ""), ltp_at_placement=result.get("ltp_at_placement"))
+                        store_signal_metadata(
+                            message_id,
+                            signal,
+                            "success",
+                            gtt_ids,
+                            instrument_key=result.get("instrument_token", ""),
+                            ltp_at_placement=result.get("ltp_at_placement"),
+                            gtt_request_payload=result.get("request_payload"),
+                        )
                         logger.info(f"✅ GTT Order placed - IDs: {gtt_ids}")
                     else:
                         store_signal_metadata(message_id, signal, "failed")
