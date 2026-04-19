@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
 
 import db
+from latency import duration_ms, log_latency, now_ms, now_perf_ns
 from settings import LOG_DIR
 
 # Load .env from same directory as this script
@@ -250,6 +251,15 @@ def parse_expiry_date(expiry_str: str) -> Optional[str]:
 instrument_cache = InstrumentCache()
 
 
+def _safe_int_ms(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 # ============================================================================
 # SIGNAL PARSING
 # ============================================================================
@@ -402,7 +412,11 @@ def parse_message_to_signal(raw_message: Dict[str, Any]) -> Optional[Dict[str, A
 # GTT ORDER PLACEMENT
 # ============================================================================
 
-def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
+def place_gtt_order_upstox(
+    signal: Dict[str, Any],
+    trace_id: str = "unknown",
+    redis_message_id: str = "unknown",
+) -> Dict[str, Any]:
     """
     Place GTT order directly to Upstox API v3.
 
@@ -412,6 +426,12 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Response from Upstox API
     """
+    placement_started_perf = now_perf_ns()
+    instrument_lookup_ms = None
+    payload_build_ms = None
+    upstox_post_ms = None
+    ltp_ms = None
+
     try:
         # Get required fields
         action = signal.get("action", "").upper()
@@ -450,7 +470,9 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"   Expiry: {expiry_str} | Qty: {quantity} | Product: {product}")
 
         # Find instrument in cache
+        instrument_lookup_started_perf = now_perf_ns()
         instrument = instrument_cache.find_instrument(underlying, strike, opt_type, expiry_str)
+        instrument_lookup_ms = duration_ms(instrument_lookup_started_perf)
         if not instrument:
             logger.error(f"❌ Could not find instrument in Upstox")
             return {"status": "error", "message": "Instrument not found in Upstox"}
@@ -468,6 +490,8 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
             logger.error("❌ Invalid computed quantity: must be greater than 0")
             return {"status": "error", "message": "Invalid computed quantity"}
         logger.info(f"   📦 Quantity: {quantity} lot(s) × {lot_size} = {api_quantity} shares")
+
+        payload_started_perf = now_perf_ns()
 
         # Determine trigger type based on action
         # For BUY: entry triggers when price goes ABOVE entry_low
@@ -510,6 +534,7 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
             "instrument_token": instrument_token,
             "transaction_type": action
         }
+        payload_build_ms = duration_ms(payload_started_perf)
 
         if PRINT_DEBUG:
             logger.debug(f"📤 Upstox Payload:\n{json.dumps(payload, indent=2)}")
@@ -520,9 +545,30 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
         resp = None
         for attempt in range(max_retries):
             try:
+                upstox_post_started_perf = now_perf_ns()
                 resp = requests.post(url, json=payload, headers=headers, timeout=30)
+                upstox_post_ms = duration_ms(upstox_post_started_perf)
+                log_latency(
+                    logger,
+                    trace_id,
+                    "upstox_post_attempt",
+                    redis_message_id=redis_message_id,
+                    attempt=attempt + 1,
+                    post_ms=upstox_post_ms,
+                    http_status=resp.status_code,
+                )
                 break  # Success
             except requests.exceptions.Timeout:
+                post_timeout_ms = duration_ms(upstox_post_started_perf)
+                log_latency(
+                    logger,
+                    trace_id,
+                    "upstox_post_attempt",
+                    redis_message_id=redis_message_id,
+                    attempt=attempt + 1,
+                    post_ms=post_timeout_ms,
+                    status="timeout",
+                )
                 if attempt < max_retries - 1:
                     logger.warning(f"⚠️  Timeout on attempt {attempt + 1}, retrying...")
                     time.sleep(2)
@@ -544,13 +590,28 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
                 logger.info(f"✅ GTT Order placed successfully! IDs: {gtt_ids}")
                 result["instrument_token"] = instrument_token
                 result["request_payload"] = payload
+                ltp_started_perf = now_perf_ns()
                 ltp = fetch_ltp(instrument_token)
+                ltp_ms = duration_ms(ltp_started_perf)
                 result["ltp_at_placement"] = ltp
+                result["latency_metrics"] = {
+                    "instrument_lookup_ms": instrument_lookup_ms,
+                    "payload_build_ms": payload_build_ms,
+                    "upstox_post_ms": upstox_post_ms,
+                    "ltp_ms": ltp_ms,
+                    "upstox_total_ms": duration_ms(placement_started_perf),
+                }
                 if ltp:
                     logger.info(f"   💹 LTP at placement: {ltp}")
                 return result
             else:
                 logger.error(f"❌ GTT Order failed: {result.get('message', 'Unknown error')}")
+                result["latency_metrics"] = {
+                    "instrument_lookup_ms": instrument_lookup_ms,
+                    "payload_build_ms": payload_build_ms,
+                    "upstox_post_ms": upstox_post_ms,
+                    "upstox_total_ms": duration_ms(placement_started_perf),
+                }
                 return result
         else:
             error_msg = resp.text
@@ -564,14 +625,27 @@ def place_gtt_order_upstox(signal: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "status": "error",
                 "message": error_msg,
-                "code": resp.status_code
+                "code": resp.status_code,
+                "latency_metrics": {
+                    "instrument_lookup_ms": instrument_lookup_ms,
+                    "payload_build_ms": payload_build_ms,
+                    "upstox_post_ms": upstox_post_ms,
+                    "upstox_total_ms": duration_ms(placement_started_perf),
+                },
             }
 
     except Exception as e:
         logger.exception(f"❌ Exception placing GTT order:")
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(e),
+            "latency_metrics": {
+                "instrument_lookup_ms": instrument_lookup_ms,
+                "payload_build_ms": payload_build_ms,
+                "upstox_post_ms": upstox_post_ms,
+                "ltp_ms": ltp_ms,
+                "upstox_total_ms": duration_ms(placement_started_perf),
+            },
         }
 
 
@@ -685,15 +759,47 @@ def start_stream_consumer():
 
     while True:
         try:
+            loop_started_perf = now_perf_ns()
             entries = redis_client.xread({REDIS_STREAM: last_id}, count=10, block=5000)
+            xread_wait_ms = duration_ms(loop_started_perf)
 
             if not entries:
                 continue
 
+            log_latency(
+                logger,
+                "unknown",
+                "redis_xread",
+                wait_ms=xread_wait_ms,
+                stream=REDIS_STREAM,
+                batch_count=len(entries),
+            )
+
             for stream_name, messages in entries:
                 for message_id, message_kv in messages:
+                    strategy_started_perf = now_perf_ns()
+                    strategy_received_at_ms = now_ms()
+                    trace_id = str(message_kv.get("trace_id") or "unknown")
+                    listener_published_at_ms = _safe_int_ms(message_kv.get("listener_published_at_ms"))
+                    telegram_received_at_ms = _safe_int_ms(message_kv.get("telegram_received_at_ms"))
+                    redis_wait_ms = None
+                    signal_age_ms = None
+                    if listener_published_at_ms is not None:
+                        redis_wait_ms = strategy_received_at_ms - listener_published_at_ms
+                    if telegram_received_at_ms is not None:
+                        signal_age_ms = strategy_received_at_ms - telegram_received_at_ms
+
                     logger.info("=" * 80)
                     logger.info(f"📨 Processing Signal ID: {message_id}")
+
+                    log_latency(
+                        logger,
+                        trace_id,
+                        "strategy_receive",
+                        redis_message_id=message_id,
+                        redis_wait_ms=redis_wait_ms,
+                        signal_age_ms=signal_age_ms,
+                    )
 
                     # Dedupe check
                     if message_id in processed_ids:
@@ -702,20 +808,49 @@ def start_stream_consumer():
                         continue
 
                     try:
+                        dedupe_started_perf = now_perf_ns()
                         if redis_client.zscore(PROCESSED_ZSET, message_id) is not None:
                             logger.info(f"⏭️  Found in processed set - Skipping")
+                            log_latency(
+                                logger,
+                                trace_id,
+                                "strategy",
+                                redis_message_id=message_id,
+                                dedupe_ms=duration_ms(dedupe_started_perf),
+                                redis_wait_ms=redis_wait_ms,
+                                status="already_processed",
+                                total_ms=duration_ms(strategy_started_perf),
+                            )
                             last_id = message_id
                             continue
+                        dedupe_ms = duration_ms(dedupe_started_perf)
                     except Exception:
-                        pass
+                        dedupe_ms = None
 
                     processed_ids.add(message_id)
 
                     # Parse signal
+                    parse_started_perf = now_perf_ns()
                     signal = parse_message_to_signal(message_kv)
+                    parse_ms = duration_ms(parse_started_perf)
                     if not signal:
                         logger.error(f"❌ Could not parse signal")
+                        metadata_started_perf = now_perf_ns()
                         store_signal_metadata(message_id, {}, "parse_error")
+                        metadata_ms = duration_ms(metadata_started_perf)
+                        log_latency(
+                            logger,
+                            trace_id,
+                            "strategy",
+                            redis_message_id=message_id,
+                            redis_wait_ms=redis_wait_ms,
+                            signal_age_ms=signal_age_ms,
+                            dedupe_ms=dedupe_ms,
+                            parse_ms=parse_ms,
+                            metadata_ms=metadata_ms,
+                            total_ms=duration_ms(strategy_started_perf),
+                            status="parse_error",
+                        )
                         last_id = message_id
                         continue
 
@@ -724,10 +859,17 @@ def start_stream_consumer():
 
                     # Place GTT order
                     logger.info("🔄 Placing GTT order via Upstox API v3...")
-                    result = place_gtt_order_upstox(signal)
+                    result = place_gtt_order_upstox(signal, trace_id=trace_id, redis_message_id=message_id)
+                    placement_metrics = result.get("latency_metrics") or {}
+                    upstox_total_ms = placement_metrics.get("upstox_total_ms")
+                    instrument_lookup_ms = placement_metrics.get("instrument_lookup_ms")
+                    payload_build_ms = placement_metrics.get("payload_build_ms")
+                    upstox_post_ms = placement_metrics.get("upstox_post_ms")
+                    ltp_ms = placement_metrics.get("ltp_ms")
 
                     # Store result
                     gtt_ids = None
+                    metadata_started_perf = now_perf_ns()
                     if result.get("status") == "success":
                         gtt_ids = result.get("data", {}).get("gtt_order_ids")
                         store_signal_metadata(
@@ -739,10 +881,46 @@ def start_stream_consumer():
                             ltp_at_placement=result.get("ltp_at_placement"),
                             gtt_request_payload=result.get("request_payload"),
                         )
+                        metadata_ms = duration_ms(metadata_started_perf)
                         logger.info(f"✅ GTT Order placed - IDs: {gtt_ids}")
                     else:
                         store_signal_metadata(message_id, signal, "failed")
+                        metadata_ms = duration_ms(metadata_started_perf)
                         logger.error(f"❌ GTT Order failed: {result.get('message')}")
+
+                    strategy_total_ms = duration_ms(strategy_started_perf)
+                    status = "success" if result.get("status") == "success" else "failed"
+                    log_latency(
+                        logger,
+                        trace_id,
+                        "strategy",
+                        redis_message_id=message_id,
+                        instrument=signal.get("underlying"),
+                        strike=signal.get("strike"),
+                        option_type=signal.get("option_type"),
+                        redis_wait_ms=redis_wait_ms,
+                        signal_age_ms=signal_age_ms,
+                        dedupe_ms=dedupe_ms,
+                        parse_ms=parse_ms,
+                        instrument_lookup_ms=instrument_lookup_ms,
+                        payload_build_ms=payload_build_ms,
+                        upstox_post_ms=upstox_post_ms,
+                        upstox_total_ms=upstox_total_ms,
+                        ltp_ms=ltp_ms,
+                        metadata_ms=metadata_ms,
+                        total_ms=strategy_total_ms,
+                        status=status,
+                    )
+
+                    if telegram_received_at_ms is not None:
+                        log_latency(
+                            logger,
+                            trace_id,
+                            "end_to_end",
+                            redis_message_id=message_id,
+                            telegram_to_gtt_response_ms=(now_ms() - telegram_received_at_ms),
+                            status=status,
+                        )
 
                     # Update tracking
                     last_id = message_id

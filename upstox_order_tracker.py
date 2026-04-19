@@ -19,6 +19,7 @@ import websockets
 from dotenv import load_dotenv
 
 import db
+from latency import duration_ms, log_latency, now_perf_ns
 from settings import LOG_DIR
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -65,6 +66,7 @@ def _safe_int(value: Any) -> Optional[int]:
 
 
 def _get_portfolio_ws_url() -> str:
+    started_perf = now_perf_ns()
     url = f"{UPSTOX_BASE_URL}/v2/feed/portfolio-stream-feed/authorize"
     resp = requests.get(
         url,
@@ -78,11 +80,13 @@ def _get_portfolio_ws_url() -> str:
     if not ws_url:
         raise RuntimeError("Portfolio WS authorize response did not include authorized URI")
     logger.info("🔗 Portfolio WebSocket URL obtained")
+    log_latency(logger, "unknown", "tracker_ws_auth", auth_ms=duration_ms(started_perf), status="success")
     return ws_url
 
 
 def _fetch_gtt_details(gtt_order_id: str) -> dict | None:
     url = f"{UPSTOX_BASE_URL}/v3/order/gtt"
+    started_perf = now_perf_ns()
     try:
         resp = requests.get(
             url,
@@ -91,14 +95,44 @@ def _fetch_gtt_details(gtt_order_id: str) -> dict | None:
             timeout=10,
         )
         resp.raise_for_status()
-        return resp.json().get("data", {})
+        data = resp.json().get("data", {})
+        if isinstance(data, list):
+            # Some responses return a list; select the matching GTT row when possible.
+            for item in data:
+                if isinstance(item, dict) and str(item.get("gtt_order_id") or item.get("id") or "") == str(gtt_order_id):
+                    data = item
+                    break
+            else:
+                data = data[0] if data and isinstance(data[0], dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="gtt_details",
+            gtt_order_id=gtt_order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="success",
+        )
+        return data
     except requests.RequestException as exc:
         logger.debug(f"Could not fetch GTT details for {gtt_order_id}: {exc}")
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="gtt_details",
+            gtt_order_id=gtt_order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="error",
+        )
         return None
 
 
 def _fetch_order_history(order_id: str) -> list[dict]:
     url = f"{UPSTOX_BASE_URL}/v2/order/history"
+    started_perf = now_perf_ns()
     try:
         resp = requests.get(
             url,
@@ -107,14 +141,33 @@ def _fetch_order_history(order_id: str) -> list[dict]:
             timeout=10,
         )
         resp.raise_for_status()
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="order_history",
+            order_id=order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="success",
+        )
         return resp.json().get("data", []) or []
     except requests.RequestException as exc:
         logger.debug(f"Could not fetch order history for {order_id}: {exc}")
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="order_history",
+            order_id=order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="error",
+        )
         return []
 
 
 def _fetch_order_trades(order_id: str) -> list[dict]:
     url = f"{UPSTOX_BASE_URL}/v2/order/trades"
+    started_perf = now_perf_ns()
     try:
         resp = requests.get(
             url,
@@ -123,9 +176,27 @@ def _fetch_order_trades(order_id: str) -> list[dict]:
             timeout=10,
         )
         resp.raise_for_status()
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="order_trades",
+            order_id=order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="success",
+        )
         return resp.json().get("data", []) or []
     except requests.RequestException as exc:
         logger.debug(f"Could not fetch order trades for {order_id}: {exc}")
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_api_fetch",
+            api="order_trades",
+            order_id=order_id,
+            api_backfill_ms=duration_ms(started_perf),
+            status="error",
+        )
         return []
 
 
@@ -185,9 +256,19 @@ def _apply_entry_fill(signal_id: int, signal: dict, price: Optional[float]):
     if price is None:
         return
     if signal.get("status") != "ACTIVE":
+        db_started_perf = now_perf_ns()
         logger.info(f"✅ ENTRY EXECUTED | signal_id={signal_id} | price={price}")
         db.update_signal_entry_executed(signal_id, price)
         db.insert_price_event(signal_id, "ENTRY_EXECUTED", price, signal.get("entry_low"))
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_db_update",
+            update_type="entry",
+            signal_id=signal_id,
+            db_ms=duration_ms(db_started_perf),
+            status="success",
+        )
 
 
 def _apply_exit_fill(signal_id: int, signal: dict, strategy: str, price: Optional[float]):
@@ -197,13 +278,26 @@ def _apply_exit_fill(signal_id: int, signal: dict, strategy: str, price: Optiona
         return
     exit_reason = "TARGET1_HIT" if strategy == "TARGET" else "STOPLOSS_HIT"
     pnl = _compute_exit_pnl(signal, price)
+    db_started_perf = now_perf_ns()
     logger.info(f"💰 EXIT EXECUTED | signal_id={signal_id} | strategy={strategy} | price={price} | pnl={pnl}")
     db.update_signal_exit_executed(signal_id, price, pnl, exit_reason)
     db.insert_price_event(signal_id, exit_reason, price)
+    log_latency(
+        logger,
+        "unknown",
+        "tracker_db_update",
+        update_type=strategy.lower(),
+        signal_id=signal_id,
+        db_ms=duration_ms(db_started_perf),
+        status="success",
+    )
 
 
 def _sync_order_from_api(signal_id: int, order_id: str, strategy: str):
+    total_started_perf = now_perf_ns()
+    db_started_perf = None
     trades = _fetch_order_trades(order_id)
+    db_started_perf = now_perf_ns()
     if trades:
         db.replace_trade_executions(signal_id, order_id, trades)
     history = _fetch_order_history(order_id)
@@ -215,21 +309,55 @@ def _sync_order_from_api(signal_id: int, order_id: str, strategy: str):
         order_payload = {"order_id": order_id}
     final_price = _final_price_from_payload(order_payload, trades)
     signal = db.get_signal(signal_id)
+    db_ms = duration_ms(db_started_perf)
     if not signal:
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_sync",
+            signal_id=signal_id,
+            order_id=order_id,
+            strategy=strategy,
+            db_ms=db_ms,
+            total_ms=duration_ms(total_started_perf),
+            status="signal_missing",
+        )
         return
     if strategy == "ENTRY":
         _apply_entry_fill(signal_id, signal, final_price)
     elif strategy in ("TARGET", "STOPLOSS"):
         _apply_exit_fill(signal_id, signal, strategy, final_price)
 
+    log_latency(
+        logger,
+        "unknown",
+        "tracker_sync",
+        signal_id=signal_id,
+        order_id=order_id,
+        strategy=strategy,
+        db_ms=db_ms,
+        total_ms=duration_ms(total_started_perf),
+        status="success",
+    )
+
 
 def _handle_gtt_update(payload: dict):
+    started_perf = now_perf_ns()
     gtt_order_id = payload.get("gtt_order_id")
     signal = db.get_signal_by_gtt_order_id(gtt_order_id)
     signal_id = signal["id"] if signal else None
     _record_raw_event(signal_id, payload)
     if not signal:
         logger.warning(f"⚠️ GTT update received for unknown gtt_order_id={gtt_order_id}")
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_event",
+            update_type="gtt_order",
+            gtt_order_id=gtt_order_id,
+            total_ms=duration_ms(started_perf),
+            status="unknown_signal",
+        )
         return
 
     db.set_signal_gtt_order(signal_id, gtt_order_id)
@@ -261,8 +389,20 @@ def _handle_gtt_update(payload: dict):
         if order_id:
             _sync_order_from_api(signal_id, order_id, strategy)
 
+    log_latency(
+        logger,
+        "unknown",
+        "tracker_event",
+        update_type="gtt_order",
+        gtt_order_id=gtt_order_id,
+        signal_id=signal_id,
+        total_ms=duration_ms(started_perf),
+        status="processed",
+    )
+
 
 def _handle_order_update(payload: dict):
+    started_perf = now_perf_ns()
     order_id = payload.get("order_id")
     signal = db.get_signal_by_order_id(order_id)
     signal_id = signal["id"] if signal else None
@@ -272,6 +412,15 @@ def _handle_order_update(payload: dict):
 
     if not signal or not strategy:
         logger.warning(f"⚠️ Order update received for unknown order_id={order_id}")
+        log_latency(
+            logger,
+            "unknown",
+            "tracker_event",
+            update_type="order",
+            order_id=order_id,
+            total_ms=duration_ms(started_perf),
+            status="unknown_signal",
+        )
         return
 
     trades = _fetch_order_trades(order_id)
@@ -292,13 +441,33 @@ def _handle_order_update(payload: dict):
         else:
             db.update_tracker_fields(signal_id, tracker_status=f"{strategy}_ORDER_ISSUE", notes=notes)
 
+    log_latency(
+        logger,
+        "unknown",
+        "tracker_event",
+        update_type="order",
+        order_id=order_id,
+        signal_id=signal_id,
+        total_ms=duration_ms(started_perf),
+        status="processed",
+    )
+
 
 def _process_payload(payload: dict):
+    started_perf = now_perf_ns()
     update_type = payload.get("update_type")
     if update_type == "gtt_order":
         _handle_gtt_update(payload)
     elif update_type == "order":
         _handle_order_update(payload)
+    log_latency(
+        logger,
+        "unknown",
+        "tracker_payload",
+        update_type=update_type or "unknown",
+        total_ms=duration_ms(started_perf),
+        status="processed",
+    )
 
 
 def _startup_backfill():
@@ -312,9 +481,12 @@ def _startup_backfill():
         if gtt_order_id:
             gtt_data = _fetch_gtt_details(gtt_order_id)
             if gtt_data:
-                gtt_data["update_type"] = "gtt_order"
-                _process_payload(gtt_data)
-                db.insert_gtt_status_check(signal["id"], gtt_order_id, str(gtt_data.get("status", "")))
+                if isinstance(gtt_data, dict):
+                    gtt_data["update_type"] = "gtt_order"
+                    _process_payload(gtt_data)
+                    db.insert_gtt_status_check(signal["id"], gtt_order_id, str(gtt_data.get("status", "")))
+                else:
+                    logger.warning(f"⚠️ Skipping unexpected gtt_details payload type: {type(gtt_data).__name__}")
 
         for strategy, order_id in (
             ("ENTRY", signal.get("entry_order_id")),

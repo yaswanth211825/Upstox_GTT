@@ -14,6 +14,7 @@ import redis.asyncio as redis
 from telethon import TelegramClient, events
 
 from entity_finder import resolve_entity
+from latency import duration_ms, log_latency, now_ms, now_perf_ns
 from ParseerWithAI.ai_signal_parser import AISignalParser
 from settings import LOG_DIR, TELEGRAM_SESSION_PATH
 
@@ -102,40 +103,99 @@ async def main():
 
     @client.on(events.NewMessage(chats=group))
     async def signal_handler(event):
+        listener_started_perf = now_perf_ns()
+        received_fallback_ms = now_ms()
+        telegram_received_at_ms = received_fallback_ms
+        try:
+            if getattr(event.message, "date", None):
+                telegram_received_at_ms = int(event.message.date.timestamp() * 1000)
+        except Exception:
+            telegram_received_at_ms = received_fallback_ms
+
+        trace_id = f"tg:{group.id}:{event.message.id}"
         message_text = event.message.text
         if not message_text:
             return
+
+        prefilter_ms = now_ms() - telegram_received_at_ms
         if not parser.should_process(message_text):
             logger.debug("Message filtered (not a signal)")
+            log_latency(
+                logger,
+                trace_id,
+                "listener",
+                telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                status="filtered",
+                total_ms=duration_ms(listener_started_perf),
+            )
             return
 
         msg_dedup_key = f"msg:{group.id}:{event.message.id}"
-        now_ms_pre = int(time.time() * 1000)
+        msg_dedupe_started_perf = now_perf_ns()
+        now_ms_pre = now_ms()
         try:
             msg_added = await r.zadd(dedupe_zset, {msg_dedup_key: now_ms_pre}, nx=True)
         except Exception:
             msg_added = 1
+        msg_dedupe_ms = duration_ms(msg_dedupe_started_perf)
         if msg_added == 0:
             logger.info(f"Message already processed by another parser, skipping: {msg_dedup_key}")
+            log_latency(
+                logger,
+                trace_id,
+                "listener",
+                telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                message_dedupe_ms=msg_dedupe_ms,
+                status="message_duplicate",
+                total_ms=duration_ms(listener_started_perf),
+            )
             return
 
         try:
+            ai_started_perf = now_perf_ns()
             signal = parser.parse(message_text)
+            ai_parse_ms = duration_ms(ai_started_perf)
             if not signal:
+                log_latency(
+                    logger,
+                    trace_id,
+                    "listener",
+                    telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                    message_dedupe_ms=msg_dedupe_ms,
+                    ai_ms=ai_parse_ms,
+                    status="ai_no_signal",
+                    total_ms=duration_ms(listener_started_perf),
+                )
                 return
 
-            if getattr(signal, "ai_latency_ms", None) is not None:
-                logger.info(f"⏱️ AI parse latency: {signal.ai_latency_ms:.0f} ms")
+            ai_latency_ms = getattr(signal, "ai_latency_ms", None)
+            if ai_latency_ms is not None:
+                logger.info(f"⏱️ AI parse latency: {ai_latency_ms:.0f} ms")
+            else:
+                ai_latency_ms = ai_parse_ms
 
-            now_ms = int(time.time() * 1000)
+            now_ms_value = now_ms()
+            signal_dedupe_started_perf = now_perf_ns()
             try:
-                added = await r.zadd(dedupe_zset, {signal.signal_hash: now_ms}, nx=True)
+                added = await r.zadd(dedupe_zset, {signal.signal_hash: now_ms_value}, nx=True)
             except Exception as exc:
                 logger.error(f"Dedupe check failed: {exc}")
                 added = 1
+            signal_dedupe_ms = duration_ms(signal_dedupe_started_perf)
 
             if added == 0:
                 logger.info(f"🔄 Duplicate detected, skipping: {signal.to_one_line()}")
+                log_latency(
+                    logger,
+                    trace_id,
+                    "listener",
+                    telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                    message_dedupe_ms=msg_dedupe_ms,
+                    ai_ms=ai_latency_ms,
+                    signal_dedupe_ms=signal_dedupe_ms,
+                    status="signal_duplicate",
+                    total_ms=duration_ms(listener_started_perf),
+                )
                 return
 
             try:
@@ -146,6 +206,7 @@ async def main():
                 pass
 
             cleaned = signal.to_one_line()
+            listener_published_at_ms = now_ms()
             stream_payload = {
                 "timestamp": str(int(time.time())),
                 "message": cleaned,
@@ -164,17 +225,50 @@ async def main():
                 "group_id": str(group.id),
                 "message_id": str(event.message.id),
                 "sender_id": str(event.message.sender_id or ""),
+                "trace_id": trace_id,
+                "telegram_received_at_ms": str(telegram_received_at_ms),
+                "listener_published_at_ms": str(listener_published_at_ms),
+                "ai_latency_ms": str(int(ai_latency_ms)),
+                "source_message_id": str(event.message.id),
             }
 
             try:
+                publish_started_perf = now_perf_ns()
                 msgid = await r.xadd(REDIS_STREAM_KEY, stream_payload)
+                redis_publish_ms = duration_ms(publish_started_perf)
+                listener_total_ms = duration_ms(listener_started_perf)
                 logger.info(f"✅ Published to {REDIS_STREAM_KEY}: {cleaned}")
                 logger.info(f"   Redis ID: {msgid}")
                 print(f"✅ SIGNAL PUBLISHED: {cleaned}")
+                log_latency(
+                    logger,
+                    trace_id,
+                    "listener",
+                    telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                    message_dedupe_ms=msg_dedupe_ms,
+                    ai_ms=int(ai_latency_ms),
+                    signal_dedupe_ms=signal_dedupe_ms,
+                    redis_publish_ms=redis_publish_ms,
+                    total_ms=listener_total_ms,
+                    message_id=event.message.id,
+                    redis_message_id=msgid,
+                    status="published",
+                )
             except Exception as exc:
                 logger.error(f"❌ Failed to publish to Redis: {exc}")
                 logger.error(f"Raw message: {message_text}")
                 logger.error(traceback.format_exc())
+                log_latency(
+                    logger,
+                    trace_id,
+                    "listener",
+                    telegram_received_to_prefilter_ms=max(prefilter_ms, 0),
+                    message_dedupe_ms=msg_dedupe_ms,
+                    ai_ms=int(ai_latency_ms),
+                    signal_dedupe_ms=signal_dedupe_ms,
+                    total_ms=duration_ms(listener_started_perf),
+                    status="publish_failed",
+                )
 
             if OPENALGO_WEBHOOK_URL and OPENALGO_API_KEY:
                 openalgo_payload = {
@@ -201,6 +295,13 @@ async def main():
         except Exception as exc:
             logger.error(f"Unexpected error in handler: {exc}")
             logger.error(traceback.format_exc())
+            log_latency(
+                logger,
+                trace_id,
+                "listener",
+                total_ms=duration_ms(listener_started_perf),
+                status="handler_exception",
+            )
 
     logger.info("🚀 AI-Powered Telegram Gateway running...")
     logger.info("   Pre-filtering messages with regex")
