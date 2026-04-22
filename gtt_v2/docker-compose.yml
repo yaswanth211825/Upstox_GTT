@@ -1,0 +1,142 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gttpassword}
+      POSTGRES_DB: gtt_trading
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: on-failure
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: on-failure
+
+  signal-ingestor:
+    build:
+      context: .
+      dockerfile: services/signal_ingestor/Dockerfile
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-gttpassword}@db:5432/gtt_trading?sslmode=disable
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/tmp/alive'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: on-failure
+
+  trading-engine:
+    build:
+      context: .
+      dockerfile: services/trading_engine/Dockerfile
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-gttpassword}@db:5432/gtt_trading?sslmode=disable
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/tmp/alive'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: on-failure
+
+  order-tracker:
+    build:
+      context: .
+      dockerfile: services/order_tracker/Dockerfile
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-gttpassword}@db:5432/gtt_trading?sslmode=disable
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/tmp/alive'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: on-failure
+
+  price-monitor:
+    build:
+      context: .
+      dockerfile: services/price_monitor/Dockerfile
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-gttpassword}@db:5432/gtt_trading?sslmode=disable
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; f='/tmp/alive'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<120 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: on-failure
+
+  admin-api:
+    build:
+      context: .
+      dockerfile: services/admin_api/Dockerfile
+    env_file: .env
+    environment:
+      POSTGRES_DSN: postgres://postgres:${POSTGRES_PASSWORD:-gttpassword}@db:5432/gtt_trading?sslmode=disable
+    ports:
+      - "0.0.0.0:8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: on-failure
+
+volumes:
+  postgres_data:
+  redis_data:
