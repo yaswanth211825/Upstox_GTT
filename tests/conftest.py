@@ -25,6 +25,7 @@ os.environ.setdefault("UPSTOX_BASE_URL", "http://localhost:19999")
 os.environ.setdefault("DEFAULT_QUANTITY", "1")
 os.environ.setdefault("REDIS_STREAM_NAME", "raw_trade_signals")
 os.environ.setdefault("REDIS_START_FROM", "resume")
+os.environ.setdefault("USE_POOLED_HTTP_POST", "false")
 
 # ── Mock the redis module BEFORE gtt_strategy imports it
 # gtt_strategy.py does redis.Redis(...).ping() at module level — must succeed

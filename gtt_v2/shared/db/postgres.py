@@ -37,22 +37,31 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
     migrations_dir = pathlib.Path(__file__).parent / "migrations"
     sql_files = sorted(migrations_dir.glob("*.sql"))
     async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version TEXT PRIMARY KEY,
-                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-        """)
-        for sql_file in sql_files:
-            version = sql_file.stem
-            applied = await conn.fetchval(
-                "SELECT 1 FROM schema_migrations WHERE version = $1", version
-            )
-            if applied:
-                continue
-            sql = sql_file.read_text()
-            await conn.execute(sql)
-            await conn.execute(
-                "INSERT INTO schema_migrations (version) VALUES ($1)", version
-            )
-            log.info("migration_applied", version=version)
+        # Serialize migrations across services so concurrent startups do not
+        # race on schema_migrations bookkeeping.
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", 884211)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            for sql_file in sql_files:
+                version = sql_file.stem
+                applied = await conn.fetchval(
+                    "SELECT 1 FROM schema_migrations WHERE version = $1", version
+                )
+                if applied:
+                    continue
+                sql = sql_file.read_text()
+                await conn.execute(sql)
+                await conn.execute(
+                    """
+                    INSERT INTO schema_migrations (version)
+                    VALUES ($1)
+                    ON CONFLICT (version) DO NOTHING
+                    """,
+                    version,
+                )
+                log.info("migration_applied", version=version)

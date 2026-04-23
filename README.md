@@ -3,7 +3,8 @@
 Unified Telegram -> Redis -> Upstox GTT execution stack.
 
 This repo now contains:
-- Telegram AI listener
+- Frontend signal bridge (low-latency ingestion)
+- Telegram AI listener (kept for optional mode)
 - Redis stream consumer
 - Upstox GTT placer
 - Upstox event-driven order tracker
@@ -21,12 +22,17 @@ If you want the venv python explicitly:
 .venv/bin/python app.py
 ```
 
+Choose the ingress mode in `.env` with `PROCESS_MODE`:
+
+- `PROCESS_MODE=web` starts the browser form bridge.
+- `PROCESS_MODE=telegram` starts the Telegram AI listener.
+
 ## Runtime Flow
 
 ```text
-Telegram Channel
+Frontend App
     ↓
-telegram_ai_listener.py
+trade_terminal_app/frontend_signal_bridge.py
     ↓
 Redis stream (raw_trade_signals)
     ↓
@@ -39,9 +45,12 @@ upstox_order_tracker.py
 SQLite DB + logs
 ```
 
+Optional mode (kept in codebase): Telegram -> AI parser -> Redis stream.
+
 ## Main Files
 
 - `app.py` : single-entry supervisor that starts all long-running services
+- `trade_terminal_app/frontend_signal_bridge.py` : accepts direct frontend JSON signals and publishes to Redis
 - `telegram_ai_listener.py` : listens to Telegram and publishes parsed signals to Redis
 - `ParseerWithAI/ai_signal_parser.py` : Gemini/OpenAI-based parser
 - `gtt_strategy.py` : consumes Redis signals and places GTT orders

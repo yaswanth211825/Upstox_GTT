@@ -12,6 +12,8 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    ports:
+      - "8787:8787"
     env_file:
       - .env
     environment:
@@ -21,6 +23,8 @@ services:
       APP_LOG_DIR: /app/data/logs
       APP_DB_PATH: /app/data/gtt_signals.db
       TELEGRAM_SESSION_PATH: /app/data/session_name
+      FRONTEND_BIND_HOST: 0.0.0.0
+      FRONTEND_BIND_PORT: 8787
     volumes:
       - ./data:/app/data
     command: ["python", "app.py"]

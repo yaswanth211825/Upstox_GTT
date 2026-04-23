@@ -24,6 +24,8 @@ import time
 import re
 import requests
 import gzip
+import queue
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
@@ -35,7 +37,7 @@ from settings import LOG_DIR
 # Load .env from same directory as this script
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-PRINT_DEBUG = True
+PRINT_DEBUG = os.getenv("PRINT_DEBUG", "false").lower() in ("1", "true", "yes", "on")
 
 # Logger setup
 logger = logging.getLogger("gtt_upstox")
@@ -66,6 +68,11 @@ UPSTOX_BASE_URL = os.getenv("UPSTOX_BASE_URL", "https://api.upstox.com")
 DEFAULT_QUANTITY = int(os.getenv("DEFAULT_QUANTITY", "4"))
 STRICT_TEMPLATE_ENABLED = os.getenv("STRICT_TEMPLATE_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 SIGNAL_TEMPLATE_DELIMITER = os.getenv("SIGNAL_TEMPLATE_DELIMITER", "|")
+HTTP_POOL_CONNECTIONS = int(os.getenv("HTTP_POOL_CONNECTIONS", "30"))
+HTTP_POOL_MAXSIZE = int(os.getenv("HTTP_POOL_MAXSIZE", "60"))
+USE_POOLED_HTTP_POST = os.getenv("USE_POOLED_HTTP_POST", "true").lower() in ("1", "true", "yes", "on")
+FETCH_LTP_AFTER_PLACEMENT = os.getenv("FETCH_LTP_AFTER_PLACEMENT", "false").lower() in ("1", "true", "yes", "on")
+ASYNC_METADATA_WRITE = os.getenv("ASYNC_METADATA_WRITE", "true").lower() in ("1", "true", "yes", "on")
 
 logger.info("🔁 GTT Strategy Bot (Direct Upstox API v3) is running.")
 
@@ -91,6 +98,26 @@ else:
     logger.info(f"✅ Upstox Access Token configured")
 
 
+def _build_http_session() -> requests.Session:
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=HTTP_POOL_CONNECTIONS,
+        pool_maxsize=HTTP_POOL_MAXSIZE,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+HTTP_SESSION = _build_http_session()
+
+
+def _http_post(url: str, **kwargs) -> requests.Response:
+    if USE_POOLED_HTTP_POST:
+        return HTTP_SESSION.post(url, **kwargs)
+    return requests.post(url, **kwargs)
+
+
 # ============================================================================
 # INSTRUMENT CACHE - Load instruments from Upstox once at startup
 # ============================================================================
@@ -99,8 +126,13 @@ class InstrumentCache:
     """Cache instruments from Upstox to avoid repeated downloads"""
     def __init__(self):
         self.instruments = {}
+        self.option_index = {}
         self.loaded = False
         self.last_reload = None
+
+    @staticmethod
+    def _option_lookup_key(underlying: str, strike: int, opt_type: str, expiry_date: str) -> tuple[str, int, str, str]:
+        return (str(underlying).upper(), int(strike), str(opt_type).upper(), str(expiry_date))
 
     def load_instruments(self):
         """Download and cache instruments from Upstox"""
@@ -109,7 +141,7 @@ class InstrumentCache:
 
             # Download complete instruments list (NSE + BSE)
             url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
-            resp = requests.get(url, timeout=30)
+            resp = HTTP_SESSION.get(url, timeout=30)
 
             if resp.status_code != 200:
                 logger.error(f"❌ Failed to download instruments: {resp.status_code}")
@@ -118,11 +150,36 @@ class InstrumentCache:
             # Decompress gzip
             instruments_data = json.loads(gzip.decompress(resp.content))
 
-            # Build searchable cache: index by "NSE_FO|KEY" format
+            # Build searchable cache: index by instrument key and by option lookup tuple.
+            self.instruments = {}
+            self.option_index = {}
             for item in instruments_data:
                 key = item.get("instrument_key")
                 if key:
                     self.instruments[key] = item
+
+                segment = item.get("segment", "")
+                if segment not in ("NSE_FO", "BSE_FO"):
+                    continue
+
+                inst_type = str(item.get("instrument_type", "")).upper()
+                if inst_type not in ("CE", "PE"):
+                    continue
+
+                underlying_symbol = str(item.get("underlying_symbol", "")).upper()
+                strike_price = item.get("strike_price")
+                expiry_ts = item.get("expiry")
+                if not underlying_symbol or strike_price is None or not expiry_ts:
+                    continue
+
+                try:
+                    strike_value = int(float(strike_price))
+                    expiry_date = datetime.fromtimestamp(expiry_ts / 1000).strftime("%Y-%m-%d")
+                    lookup_key = self._option_lookup_key(underlying_symbol, strike_value, inst_type, expiry_date)
+                    # Keep first match to avoid unnecessary overwrites when payload contains duplicates.
+                    self.option_index.setdefault(lookup_key, item)
+                except Exception:
+                    continue
 
             self.loaded = True
             self.last_reload = datetime.now()
@@ -145,47 +202,16 @@ class InstrumentCache:
             logger.warning(f"⚠️ Could not parse expiry: {expiry_str}")
             return None
 
-        # Convert YYYY-MM-DD to timestamp for comparison
         try:
-            target_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
-            # Upstox stores expiry as Unix timestamp in milliseconds (end of trading day)
-            target_ts_day = int(target_dt.timestamp() * 1000)
-        except:
-            logger.warning(f"⚠️ Could not convert expiry to timestamp: {expiry_date}")
+            lookup_key = self._option_lookup_key(underlying, strike, opt_type, expiry_date)
+        except Exception:
+            logger.warning(f"⚠️ Invalid instrument lookup values: {underlying} {strike}{opt_type} {expiry_date}")
             return None
 
-        # Search for matching instrument
-        for key, item in self.instruments.items():
-            # Filter by exchange (NSE_FO for indices, BSE_FO for sensex/bankex)
-            exchange = item.get("segment", "")
-            if exchange not in ("NSE_FO", "BSE_FO"):
-                continue
-
-            # Check if it's an option (new instruments use instrument_type directly)
-            inst_type = item.get("instrument_type", "")
-            if inst_type not in ("CE", "PE"):  # Direct CE/PE check for new format
-                continue
-
-            # Match underlying_symbol (more reliable than trading_symbol)
-            underlying_symbol = str(item.get("underlying_symbol", "")).upper()
-            if underlying.upper() != underlying_symbol:
-                continue
-
-            # Check strike
-            if item.get("strike_price") != strike:
-                continue
-
-            # Check option type
-            if item.get("instrument_type", "").upper() != opt_type.upper():
-                continue
-
-            # Check expiry - compare dates (Upstox stores as timestamp)
-            item_expiry_ts = item.get("expiry")
-            if item_expiry_ts:
-                item_expiry_date = datetime.fromtimestamp(item_expiry_ts / 1000).strftime("%Y-%m-%d")
-                if item_expiry_date == expiry_date:
-                    logger.info(f"✅ Found instrument: {key} ({item.get('trading_symbol')})")
-                    return item
+        item = self.option_index.get(lookup_key)
+        if item:
+            logger.info(f"✅ Found instrument: {item.get('instrument_key')} ({item.get('trading_symbol')})")
+            return item
 
         logger.warning(f"⚠️ Could not find instrument: {underlying} {strike}{opt_type} {expiry_str}")
         return None
@@ -249,6 +275,8 @@ def parse_expiry_date(expiry_str: str) -> Optional[str]:
 
 
 instrument_cache = InstrumentCache()
+_metadata_queue: Optional[queue.Queue] = None
+_metadata_worker_started = False
 
 
 def _safe_int_ms(value: Any) -> Optional[int]:
@@ -546,7 +574,7 @@ def place_gtt_order_upstox(
         for attempt in range(max_retries):
             try:
                 upstox_post_started_perf = now_perf_ns()
-                resp = requests.post(url, json=payload, headers=headers, timeout=30)
+                resp = _http_post(url, json=payload, headers=headers, timeout=30)
                 upstox_post_ms = duration_ms(upstox_post_started_perf)
                 log_latency(
                     logger,
@@ -590,9 +618,11 @@ def place_gtt_order_upstox(
                 logger.info(f"✅ GTT Order placed successfully! IDs: {gtt_ids}")
                 result["instrument_token"] = instrument_token
                 result["request_payload"] = payload
-                ltp_started_perf = now_perf_ns()
-                ltp = fetch_ltp(instrument_token)
-                ltp_ms = duration_ms(ltp_started_perf)
+                ltp = None
+                if FETCH_LTP_AFTER_PLACEMENT:
+                    ltp_started_perf = now_perf_ns()
+                    ltp = fetch_ltp(instrument_token)
+                    ltp_ms = duration_ms(ltp_started_perf)
                 result["ltp_at_placement"] = ltp
                 result["latency_metrics"] = {
                     "instrument_lookup_ms": instrument_lookup_ms,
@@ -654,7 +684,7 @@ def fetch_ltp(instrument_token: str) -> Optional[float]:
     try:
         url = f"{UPSTOX_BASE_URL}/v2/market-quote/ltp"
         headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-        resp = requests.get(url, headers=headers, params={"instrument_key": instrument_token}, timeout=5)
+        resp = HTTP_SESSION.get(url, headers=headers, params={"instrument_key": instrument_token}, timeout=5)
         if resp.status_code == 200:
             data = resp.json().get("data", {})
             for val in data.values():
@@ -663,6 +693,58 @@ def fetch_ltp(instrument_token: str) -> Optional[float]:
     except Exception as e:
         logger.debug(f"Could not fetch LTP for {instrument_token}: {e}")
     return None
+
+
+def _start_metadata_worker() -> None:
+    global _metadata_queue, _metadata_worker_started
+    if not ASYNC_METADATA_WRITE or _metadata_worker_started:
+        return
+
+    _metadata_queue = queue.Queue(maxsize=5000)
+
+    def _worker() -> None:
+        while True:
+            item = _metadata_queue.get()
+            if item is None:
+                _metadata_queue.task_done()
+                break
+            try:
+                store_signal_metadata(*item)
+            except Exception as exc:
+                logger.warning(f"⚠️ Metadata worker error: {exc}")
+            finally:
+                _metadata_queue.task_done()
+
+    thread = threading.Thread(target=_worker, name="metadata-writer", daemon=True)
+    thread.start()
+    _metadata_worker_started = True
+
+
+def enqueue_signal_metadata(
+    message_id: str,
+    signal: Dict,
+    status: str,
+    gtt_ids: Optional[List[str]] = None,
+    instrument_key: str = "",
+    ltp_at_placement: Optional[float] = None,
+    gtt_request_payload: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not ASYNC_METADATA_WRITE or _metadata_queue is None:
+        return False
+    try:
+        _metadata_queue.put_nowait((
+            message_id,
+            signal,
+            status,
+            gtt_ids,
+            instrument_key,
+            ltp_at_placement,
+            gtt_request_payload,
+        ))
+        return True
+    except queue.Full:
+        logger.warning("⚠️ Metadata queue full, falling back to sync write")
+        return False
 
 
 def store_signal_metadata(
@@ -742,6 +824,8 @@ def start_stream_consumer():
     # Load instruments once at startup
     if not instrument_cache.load_instruments():
         logger.warning("⚠️ Failed to load instruments. Some signals may fail to process.")
+
+    _start_metadata_worker()
 
     # Determine starting ID
     start_policy = (REDIS_START_FROM or "").strip().lower()
@@ -836,7 +920,9 @@ def start_stream_consumer():
                     if not signal:
                         logger.error(f"❌ Could not parse signal")
                         metadata_started_perf = now_perf_ns()
-                        store_signal_metadata(message_id, {}, "parse_error")
+                        enqueued = enqueue_signal_metadata(message_id, {}, "parse_error")
+                        if not enqueued:
+                            store_signal_metadata(message_id, {}, "parse_error")
                         metadata_ms = duration_ms(metadata_started_perf)
                         log_latency(
                             logger,
@@ -872,7 +958,7 @@ def start_stream_consumer():
                     metadata_started_perf = now_perf_ns()
                     if result.get("status") == "success":
                         gtt_ids = result.get("data", {}).get("gtt_order_ids")
-                        store_signal_metadata(
+                        enqueued = enqueue_signal_metadata(
                             message_id,
                             signal,
                             "success",
@@ -881,10 +967,22 @@ def start_stream_consumer():
                             ltp_at_placement=result.get("ltp_at_placement"),
                             gtt_request_payload=result.get("request_payload"),
                         )
+                        if not enqueued:
+                            store_signal_metadata(
+                                message_id,
+                                signal,
+                                "success",
+                                gtt_ids,
+                                instrument_key=result.get("instrument_token", ""),
+                                ltp_at_placement=result.get("ltp_at_placement"),
+                                gtt_request_payload=result.get("request_payload"),
+                            )
                         metadata_ms = duration_ms(metadata_started_perf)
                         logger.info(f"✅ GTT Order placed - IDs: {gtt_ids}")
                     else:
-                        store_signal_metadata(message_id, signal, "failed")
+                        enqueued = enqueue_signal_metadata(message_id, signal, "failed")
+                        if not enqueued:
+                            store_signal_metadata(message_id, signal, "failed")
                         metadata_ms = duration_ms(metadata_started_perf)
                         logger.error(f"❌ GTT Order failed: {result.get('message')}")
 

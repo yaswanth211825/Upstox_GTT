@@ -95,6 +95,32 @@ data/session_name.session
 docker compose -f docker-compose.aws.yml up -d --build
 ```
 
+## Accessing the Frontend on AWS
+
+When `PROCESS_MODE=web`, the frontend bridge is published on port `8787`.
+
+Open:
+
+```text
+http://<YOUR_AWS_PUBLIC_IP>:8787/signal
+```
+
+Examples:
+- `http://3.111.123.148:8787/signal`
+- `http://<elastic-ip>:8787/signal`
+
+If your browser is on the same machine and you don't want to expose the port publicly, you can also use SSH port forwarding:
+
+```bash
+ssh -L 8787:127.0.0.1:8787 ubuntu@<YOUR_AWS_PUBLIC_IP>
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787/signal
+```
+
 ## Persistent Data
 
 The app stores runtime state in `./data`, mounted into `/app/data` in Docker:
@@ -109,3 +135,4 @@ The app stores runtime state in `./data`, mounted into `/app/data` in Docker:
 - If the server IP changes, Upstox order placement can fail again with static-IP restriction errors.
 - Keep the static IP attached permanently before generating your next access token.
 - You will still need to refresh Upstox access tokens unless you automate that login flow later.
+- Make sure the AWS security group allows inbound TCP `8787` if you want direct browser access.

@@ -1,8 +1,8 @@
-"""Price Monitor — REST LTP polling → threshold detection → PG.
+"""Price Monitor — websocket LTP streaming → threshold detection → PG.
 
-Polls Upstox v3/market-quote/ltp every POLL_INTERVAL seconds for all tracked
-instrument keys, checks LTP against signal thresholds, auto-cancels GTTs when
-entry is never filled but first target is hit.
+Streams Upstox market data over websocket for all tracked instrument keys,
+checks LTP against signal thresholds, auto-cancels GTTs when entry is never
+filled but first target is hit.
 
 Subscription management:
   - On startup: tracks all instrument keys with PENDING/ACTIVE signals.
@@ -24,12 +24,42 @@ from shared.redis.client import (
     INSTRUMENT_UNSUBSCRIBE_CHANNEL,
 )
 from shared.upstox.client import UpstoxClient
+from shared.upstox.market_ws import MarketDataWebSocket
 from shared.heartbeat import heartbeat_loop
 
 log = structlog.get_logger()
 
-POLL_INTERVAL = 3   # seconds between LTP REST calls
-LTP_REDIS_TTL = 10  # seconds — slightly longer than poll interval
+
+def _entry_range_touched(trade: dict, ltp: float) -> bool:
+    entry_low = trade.get("entry_low")
+    entry_high = trade.get("entry_high")
+
+    if entry_high is None:
+        # BUY_ABOVE (no range given): synthesise entry_high = entry_low + 5.
+        # Entry is "touched" once LTP comes within that upper bound.
+        synthetic_high = (entry_low + 5) if entry_low is not None else None
+        return synthetic_high is not None and ltp <= synthetic_high
+
+    return entry_low is not None and entry_low <= ltp <= entry_high
+
+
+def _log_expiry_decision(trade: dict, ltp: float, timestamp: datetime, decision: str, **extra) -> None:
+    log.info(
+        "expiry_decision",
+        signal_id=trade.get("id"),
+        action=trade.get("action", "BUY"),
+        status=trade.get("status"),
+        ltp=ltp,
+        t1=trade.get("t1"),
+        entry_low=trade.get("entry_low"),
+        entry_high=trade.get("entry_high"),
+        entry_range_touched=bool(trade.get("entry_range_touched", False)),
+        entry_filled=bool(trade.get("entry_filled", False)),
+        feature_flag_enabled=bool(settings.use_entry_touch_logic),
+        tick_timestamp=timestamp.isoformat(),
+        decision=decision,
+        **extra,
+    )
 
 
 def old_expiry_logic(trade: dict, ltp: float) -> bool:
@@ -50,34 +80,35 @@ def should_expire_trade(trade: dict, ltp: float, timestamp: datetime) -> bool:
     """Single expiry decision point for all entry-not-filled expiry checks."""
     if not settings.use_entry_touch_logic:
         log.debug("expiry_logic_path", signal_id=trade.get("id"), path="legacy")
-        return old_expiry_logic(trade, ltp)
+        expired = old_expiry_logic(trade, ltp)
+        _log_expiry_decision(trade, ltp, timestamp, "legacy_expire" if expired else "legacy_keep")
+        return expired
 
     log.debug("expiry_logic_path", signal_id=trade.get("id"), path="entry_touch")
 
     signal_timestamp = trade.get("signal_timestamp")
     if signal_timestamp and timestamp < signal_timestamp:
+        _log_expiry_decision(
+            trade,
+            ltp,
+            timestamp,
+            "ignored_pre_signal_tick",
+            signal_timestamp=signal_timestamp.isoformat(),
+        )
         return False
 
     if not trade.get("entry_range_touched", False):
-        entry_low = trade.get("entry_low")
-        entry_high = trade.get("entry_high")
-
-        if entry_high is None:
-            # BUY_ABOVE (no range given): synthesise entry_high = entry_low + 5.
-            # Entry is "touched" once LTP comes within that upper bound.
-            synthetic_high = (entry_low + 5) if entry_low is not None else None
-            touched = synthetic_high is not None and ltp <= synthetic_high
-        else:
-            touched = entry_low is not None and entry_low <= ltp <= entry_high
-
+        touched = _entry_range_touched(trade, ltp)
         if touched:
             trade["entry_range_touched"] = True
             log.info("entry_range_touched", signal_id=trade.get("id"), ltp=ltp)
+            _log_expiry_decision(trade, ltp, timestamp, "entry_touch_recorded")
 
     if trade.get("entry_range_touched", False):
         t1 = trade.get("t1")
         entry_filled = bool(trade.get("entry_filled", False))
         if t1 is None:
+            _log_expiry_decision(trade, ltp, timestamp, "keep_no_t1")
             return False
 
         action = trade.get("action", "BUY")
@@ -85,7 +116,19 @@ def should_expire_trade(trade: dict, ltp: float, timestamp: datetime) -> bool:
 
         if not entry_filled and crossed_t1:
             log.info("trade_expired_via_new_logic", signal_id=trade.get("id"), ltp=ltp, t1=t1)
+            _log_expiry_decision(trade, ltp, timestamp, "expire_after_entry_touch")
             return True
+
+        _log_expiry_decision(
+            trade,
+            ltp,
+            timestamp,
+            "keep_after_entry_touch",
+            crossed_t1=crossed_t1,
+        )
+        return False
+
+    _log_expiry_decision(trade, ltp, timestamp, "keep_before_entry_touch")
 
     return False
 
@@ -208,13 +251,7 @@ class ThresholdChecker:
         # Update entry_range_touched on every tick so the gate is set as soon as LTP
         # enters the entry zone, even before T1 is reached on a later tick.
         if settings.use_entry_touch_logic and not sig.get("entry_range_touched", False):
-            entry_low = sig.get("entry_low")
-            entry_high = sig.get("entry_high")
-            if entry_high is None:
-                synthetic_high = (entry_low + 5) if entry_low is not None else None
-                _touched = synthetic_high is not None and ltp <= synthetic_high
-            else:
-                _touched = entry_low is not None and entry_low <= ltp <= entry_high
+            _touched = _entry_range_touched(sig, ltp)
             if _touched:
                 sig["entry_range_touched"] = True
                 log.info("entry_range_touched", signal_id=sig_id, ltp=ltp)
@@ -324,27 +361,6 @@ class ThresholdChecker:
         )
 
 
-async def _ltp_poll_loop(checker: ThresholdChecker, upstox: UpstoxClient, redis) -> None:
-    """Poll Upstox v3 LTP REST endpoint for all tracked instruments every POLL_INTERVAL s."""
-    while True:
-        keys = list(checker.tracked_keys)
-        if keys:
-            try:
-                ltp_data = await upstox.get_ltp_multi(keys)
-                if ltp_data:
-                    log.debug("ltp_poll_result", count=len(ltp_data))
-                    for key, ltp in ltp_data.items():
-                        await redis.set(f"ltp:{key}", str(ltp), ex=LTP_REDIS_TTL)
-                        await checker.check(key, ltp, datetime.now(timezone.utc))
-                else:
-                    log.debug("ltp_poll_empty", keys=keys)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.error("ltp_poll_error", error=str(e))
-        await asyncio.sleep(POLL_INTERVAL)
-
-
 async def main() -> None:
     configure_logging("price-monitor")
     log.info("price_monitor_starting")
@@ -358,6 +374,12 @@ async def main() -> None:
 
     checker = ThresholdChecker(pool, db_writer, redis, upstox)
     await checker.load_initial_keys()
+    market_ws = MarketDataWebSocket(
+        url_factory=upstox.get_market_stream_url,
+        redis=redis,
+        on_ltp=lambda key, ltp: checker.check(key, ltp, datetime.now(timezone.utc)),
+    )
+    await market_ws.subscribe(list(checker.tracked_keys))
 
     # Listen for instant add/remove notifications from trading engine via Redis pub/sub
     async def _pubsub_listener() -> None:
@@ -378,9 +400,11 @@ async def main() -> None:
                     channel = msg["channel"]
                     if channel == INSTRUMENT_SUBSCRIBE_CHANNEL:
                         checker.add_instrument(instrument_key)
+                        await market_ws.subscribe([instrument_key])
                         log.info("pubsub_tracking_added", instrument_key=instrument_key)
                     elif channel == INSTRUMENT_UNSUBSCRIBE_CHANNEL:
                         checker.remove_instrument(instrument_key)
+                        await market_ws.unsubscribe([instrument_key])
                         log.info("pubsub_tracking_removed", instrument_key=instrument_key)
                 else:
                     await asyncio.sleep(0.05)
@@ -392,16 +416,17 @@ async def main() -> None:
 
     writer_task  = asyncio.create_task(db_writer.run())
     pubsub_task  = asyncio.create_task(_pubsub_listener())
-    poll_task    = asyncio.create_task(_ltp_poll_loop(checker, upstox, redis))
+    market_ws_task = asyncio.create_task(market_ws.run())
     asyncio.create_task(heartbeat_loop())
     try:
-        # Run until cancelled or poll task crashes
-        await asyncio.gather(poll_task, pubsub_task, return_exceptions=False)
+        # Run until cancelled or websocket task crashes
+        await asyncio.gather(market_ws_task, pubsub_task, return_exceptions=False)
     except Exception as e:
         log.error("price_monitor_crash", error=str(e))
     finally:
         pubsub_task.cancel()
-        poll_task.cancel()
+        market_ws.stop()
+        market_ws_task.cancel()
         await db_writer.stop()
         writer_task.cancel()
         await upstox.aclose()

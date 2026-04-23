@@ -4,22 +4,40 @@ app.py -- single-entry supervisor for the unified Telegram -> Redis -> Upstox st
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 from settings import DATA_DIR, PYTHON_BIN as CONFIGURED_PYTHON_BIN
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = CONFIGURED_PYTHON_BIN or sys.executable
 PID_FILE = DATA_DIR / "app.pid"
 
-SERVICES = [
-    ("telegram_ai_listener", ["telegram_ai_listener.py"]),
-    ("gtt_strategy", ["gtt_strategy.py"]),
-    ("upstox_order_tracker", ["upstox_order_tracker.py"]),
-]
+load_dotenv(ROOT / ".env")
+
+PROCESS_MODE = os.getenv("PROCESS_MODE", os.getenv("SIGNAL_SOURCE_MODE", "web")).strip().lower()
+
+
+def _services_for_mode() -> list[tuple[str, list[str]]]:
+    shared = [
+        ("gtt_strategy", ["gtt_strategy.py"]),
+        ("upstox_order_tracker", ["upstox_order_tracker.py"]),
+    ]
+    if PROCESS_MODE == "telegram":
+        return [
+            ("telegram_ai_listener", ["telegram_ai_listener.py"]),
+            *shared,
+        ]
+    if PROCESS_MODE == "web":
+        return [
+            ("frontend_signal_bridge", ["trade_terminal_app/frontend_signal_bridge.py"]),
+            *shared,
+        ]
+    raise SystemExit("Invalid PROCESS_MODE. Use 'telegram' or 'web'.")
 
 
 def _spawn(name: str, args: list[str]) -> subprocess.Popen:
@@ -27,6 +45,17 @@ def _spawn(name: str, args: list[str]) -> subprocess.Popen:
         [PYTHON, *args],
         cwd=ROOT,
     )
+
+
+def _is_port_open(host: str, port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.3)
+    try:
+        return sock.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        sock.close()
 
 
 def main() -> int:
@@ -66,8 +95,16 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    print("Starting unified UpstoxGTT stack...")
-    for name, args in SERVICES:
+    services = _services_for_mode()
+
+    print(f"Starting unified UpstoxGTT stack in {PROCESS_MODE.upper()} mode...")
+    for name, args in services:
+        if name == "frontend_signal_bridge":
+            bridge_host = os.getenv("FRONTEND_BIND_HOST", "127.0.0.1")
+            bridge_port = int(os.getenv("FRONTEND_BIND_PORT", "8787"))
+            if _is_port_open(bridge_host, bridge_port):
+                print(f"{name} already running at {bridge_host}:{bridge_port}, reusing existing process")
+                continue
         proc = _spawn(name, args)
         processes.append((name, proc))
         print(f"{name} PID: {proc.pid}")

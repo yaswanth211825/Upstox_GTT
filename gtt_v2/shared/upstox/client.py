@@ -242,7 +242,11 @@ class UpstoxClient:
     # ── WebSocket auth ───────────────────────────────────────────────────────
 
     async def get_portfolio_stream_url(self) -> str:
-        resp = await self._request("GET", "/v2/feed/portfolio-stream-feed/authorize")
+        resp = await self._request(
+            "GET",
+            "/v2/feed/portfolio-stream-feed/authorize",
+            params={"update_types": "order,gtt_order,position,holding"},
+        )
         data = resp.get("data", resp)
         return data.get("authorizedRedirectUri") or data.get("authorized_redirect_uri")
 

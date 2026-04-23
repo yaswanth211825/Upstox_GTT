@@ -78,6 +78,7 @@ async def dashboard():
   .card .value.green { color: #16a34a; }
   .card .value.red   { color: #dc2626; }
   .section-title { font-size: .9rem; font-weight: 600; margin-bottom: 10px; color: #0f172a; }
+  .section-bar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
   .table-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid #e2e8f0; }
   table { width: 100%; border-collapse: collapse; background: #fff; }
   thead { background: #f8fafc; }
@@ -113,6 +114,8 @@ async def dashboard():
   .btn-cancel:hover { background: #fee2e2; }
   .btn-exit { background: none; border: 1px solid #7c3aed; color: #7c3aed; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: .72rem; margin-left: 4px; }
   .btn-exit:hover { background: #ede9fe; }
+  .btn-export { background:#0f172a; border:1px solid #0f172a; color:#fff; padding:7px 12px; border-radius:6px; cursor:pointer; font-size:.75rem; font-weight:600; white-space:nowrap; }
+  .btn-export:hover { background:#1e293b; border-color:#1e293b; }
   #msg { position: fixed; bottom: 20px; right: 20px; background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 6px; display: none; font-size: .82rem; z-index: 999; }
   .time-cell { font-size: .75rem; color: #64748b; white-space: nowrap; }
   .pos-section { margin-top: 28px; }
@@ -170,7 +173,10 @@ async def dashboard():
     </div>
   </div>
 
-  <p class="section-title">Signals (last 50)</p>
+  <div class="section-bar">
+    <p class="section-title" style="margin-bottom:0">Signals (last 50)</p>
+    <button class="btn-export" onclick="exportTrades()">Export Trades CSV</button>
+  </div>
   <div class="table-wrap">
   <table>
     <thead><tr>
@@ -224,6 +230,9 @@ async def dashboard():
 
 <script>
 function fmt(v) { return (v == null || v === '') ? '—' : parseFloat(v).toFixed(1); }
+let latestSummary = null;
+let latestSignals = [];
+let latestLivePnl = null;
 
 function fmtTime(iso) {
   if (!iso) return '—';
@@ -295,6 +304,9 @@ async function load() {
       fetch('/signals?limit=50').then(r => r.json()),
       fetch('/accounts/live-pnl').then(r => r.json()).catch(() => null),
     ]);
+    latestSummary = sum;
+    latestSignals = sigs || [];
+    latestLivePnl = livePnl;
 
     // ── Stats cards ──────────────────────────────────────────────────────────
     document.getElementById('s-active').textContent  = sum.active_signals ?? '—';
@@ -452,6 +464,112 @@ function showMsg(text) {
   el.textContent = text;
   el.style.display = 'block';
   setTimeout(() => el.style.display = 'none', 3500);
+}
+
+function csvCell(v) {
+  const text = v == null ? '' : String(v);
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function exportTrades() {
+  if (!latestSignals.length) {
+    showMsg('No trades to export yet');
+    return;
+  }
+
+  const now = new Date();
+  const snapshotIst = now.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  });
+
+  const totalPnl = latestLivePnl ? latestLivePnl.total_pnl : (latestSummary ? latestSummary.total_pnl : '');
+  const realizedPnl = latestLivePnl ? latestLivePnl.realized_pnl : (latestSummary ? latestSummary.realized_pnl : '');
+  const unrealizedPnl = latestLivePnl ? latestLivePnl.unrealized_pnl : '';
+
+  const lines = [
+    [csvCell('Exported At (IST)'), csvCell(snapshotIst)].join(','),
+    [csvCell('Dashboard Total P&L'), csvCell(totalPnl)].join(','),
+    [csvCell('Dashboard Realized P&L'), csvCell(realizedPnl)].join(','),
+    [csvCell('Dashboard Unrealized P&L'), csvCell(unrealizedPnl)].join(','),
+    [csvCell('Trader Profile'), csvCell(latestSummary?.trader_profile ?? '')].join(','),
+    '',
+    [
+      'ID',
+      'Signal Time (IST)',
+      'Underlying',
+      'Strike',
+      'Option Type',
+      'Expiry',
+      'Action',
+      'Trade Type',
+      'Status',
+      'Status Reason',
+      'Entry Raw',
+      'Entry Adjusted',
+      'Stoploss Raw',
+      'Stoploss Adjusted',
+      'Targets Raw',
+      'Targets Adjusted',
+      'Entry Price',
+      'Exit Price',
+      'PnL',
+      'GTT IDs'
+    ].map(csvCell).join(',')
+  ];
+
+  for (const s of latestSignals) {
+    const signalTimeIst = s.signal_at ? new Date(s.signal_at).toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    }) : '';
+    lines.push([
+      s.id,
+      signalTimeIst,
+      s.underlying,
+      s.strike ?? '',
+      s.option_type ?? '',
+      s.expiry ?? '',
+      s.action ?? '',
+      s.trade_type ?? '',
+      s.status ?? '',
+      fmtBlockReason(s.block_reason),
+      s.entry_low_raw ?? '',
+      s.entry_low_adj ?? '',
+      s.stoploss_raw ?? '',
+      s.stoploss_adj ?? '',
+      (s.targets_raw || []).join(' / '),
+      (s.targets_adj || []).join(' / '),
+      s.entry_price ?? '',
+      s.exit_price ?? '',
+      s.pnl ?? '',
+      (s.gtt_order_ids || []).join(' | ')
+    ].map(csvCell).join(','));
+  }
+
+  const blob = new Blob([lines.join('\\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = now.toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  a.href = url;
+  a.download = `gtt-dashboard-export-${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  showMsg('Trades exported');
 }
 
 async function loadPipelineLog() {

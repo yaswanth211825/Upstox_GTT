@@ -13,7 +13,7 @@ async def check_missed_entry(
     Returns (can_place, reason).
     Blocks if:
     - BUY: LTP already >= targets_adj[0]  (trade already hit target)
-    - BUY: LTP already <= stoploss_adj    (would enter into a loss immediately)
+    - SELL: LTP already <= targets_adj[0] (trade already hit target)
     If LTP not available, allows (can't verify, don't block).
     """
     if not adj.instrument_key:
@@ -31,17 +31,10 @@ async def check_missed_entry(
             reason = f"ltp={ltp} already_above_target={adj.targets_adj[0]}"
             log.warning("missed_entry_target_already_hit", reason=reason)
             return False, reason
-        if ltp <= adj.stoploss_adj:
-            reason = f"ltp={ltp} already_below_stoploss={adj.stoploss_adj}"
-            log.warning("missed_entry_below_stoploss", reason=reason)
-            return False, reason
     elif action == "SELL":
         if adj.targets_adj and ltp <= adj.targets_adj[0]:
             reason = f"ltp={ltp} already_below_target={adj.targets_adj[0]}"
             log.warning("missed_entry_target_already_hit", reason=reason)
-            return False, reason
-        if ltp >= adj.stoploss_adj:
-            reason = f"ltp={ltp} already_above_stoploss={adj.stoploss_adj}"
             return False, reason
 
     return True, ""

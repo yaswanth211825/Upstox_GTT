@@ -146,7 +146,7 @@ async def get_pending_signals_after_close(conn: asyncpg.Connection) -> list[dict
         """
         SELECT * FROM signals
         WHERE status IN ('PENDING','ACTIVE')
-          AND (signal_at AT TIME ZONE 'Asia/Kolkata')::date = CURRENT_DATE AT TIME ZONE 'Asia/Kolkata'
+          AND (signal_at AT TIME ZONE 'Asia/Kolkata')::date = (now() AT TIME ZONE 'Asia/Kolkata')::date
         """
     )
     return [dict(r) for r in rows]

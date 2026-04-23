@@ -26,8 +26,6 @@ class Settings(BaseSettings):
     default_quantity: int = 1
 
     # Trading Floor rules
-    buffer_sl_pts: float = 2.5
-    buffer_target_pts: float = 6.0
     daily_pnl_limit_pct: float = 0.10
     account_capital: float = 100_000.0   # fallback only — live value fetched from Upstox at 9:15 IST
     trader_profile: str = "SAFE"         # SAFE or RISK (profile filter disabled — see trading_engine)

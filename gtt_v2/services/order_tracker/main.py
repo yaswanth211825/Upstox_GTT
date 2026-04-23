@@ -39,6 +39,8 @@ _GTT_STATUS_MAP = {
 }
 
 _ORDER_TERMINAL_STATUSES = {"complete", "cancelled", "rejected"}
+_RULE_FILLED_STATUSES = {"completed", "complete", "triggered"}
+_OPEN_SIGNAL_STATUSES = ("PENDING", "ACTIVE")
 
 
 def _derive_strategy(
@@ -62,13 +64,14 @@ def _derive_strategy(
 
     # Exit leg — pick TARGET vs STOPLOSS by proximity of fill_price to stored trigger_price
     if fill_price is not None:
+        fill_price_num = float(fill_price)
         target_row = next((r for r in gtt_rules if r.get("strategy") == "TARGET"), None)
         stoploss_row = next((r for r in gtt_rules if r.get("strategy") == "STOPLOSS"), None)
         if target_row and stoploss_row:
             tp = float(target_row.get("trigger_price") or 0)
             sp = float(stoploss_row.get("trigger_price") or 0)
-            dist_target = abs(fill_price - tp) if tp else float("inf")
-            dist_sl = abs(fill_price - sp) if sp else float("inf")
+            dist_target = abs(fill_price_num - tp) if tp else float("inf")
+            dist_sl = abs(fill_price_num - sp) if sp else float("inf")
             return "TARGET" if dist_target <= dist_sl else "STOPLOSS"
         if target_row:
             return "TARGET"
@@ -130,6 +133,8 @@ class OrderTracker:
             mapped_status = terminal_map.get(status)
             if mapped_status:
                 await update_signal_status(conn, signal_id, mapped_status)
+
+        await self._reconcile_gtt_payload(data)
 
     async def _handle_order_update(self, data: dict) -> None:
         order_id = data.get("orderId") or data.get("order_id")
@@ -200,7 +205,13 @@ class OrderTracker:
                     "trade_id": trade.get("trade_id"),
                     "quantity": trade.get("quantity"),
                     "price": trade.get("average_price") or trade.get("price"),
-                    "side": data.get("transaction_type", "BUY"),
+                    "side": (
+                        data.get("transaction_type")
+                        or data.get("transactionType")
+                        or trade.get("transaction_type")
+                        or trade.get("transactionType")
+                        or "BUY"
+                    ),
                     # signal_id linked below once rule is resolved
                 })
 
@@ -208,6 +219,7 @@ class OrderTracker:
             fill_price = weighted_avg_price(all_trades)
             if fill_price is None:
                 return
+            fill_price = float(fill_price)
 
             # Resolve which leg row this fill belongs to
             rule = await get_gtt_rule_by_child_order_id(conn, str(order_id))
@@ -249,7 +261,7 @@ class OrderTracker:
 
             signal_row = await conn.fetchrow(
                 """
-                SELECT action, entry_price, stoploss_adj, targets_adj, status
+                SELECT action, entry_price, exit_price, stoploss_adj, targets_adj, status
                 FROM signals
                 WHERE id = $1
                 """,
@@ -257,9 +269,21 @@ class OrderTracker:
             )
             signal_action = (signal_row["action"] if signal_row else "BUY") or "BUY"
             entry_price_ref = float(signal_row["entry_price"]) if signal_row and signal_row["entry_price"] else None
+            exit_price_ref = float(signal_row["exit_price"]) if signal_row and signal_row["exit_price"] else None
+            signal_status = str(signal_row["status"]) if signal_row and signal_row["status"] else "PENDING"
             stoploss_adj = float(signal_row["stoploss_adj"]) if signal_row and signal_row["stoploss_adj"] else None
             targets_adj = signal_row["targets_adj"] if signal_row and signal_row["targets_adj"] else []
             target1_adj = float(targets_adj[0]) if targets_adj else None
+
+            if strategy == "ENTRY" and signal_status != "PENDING" and entry_price_ref is not None:
+                log.info("entry_fill_already_applied", signal_id=signal_id, order_id=order_id, status=signal_status)
+                return
+
+            if strategy in {"TARGET", "STOPLOSS"} and exit_price_ref is not None and signal_status in {
+                "TARGET1_HIT", "TARGET2_HIT", "TARGET3_HIT", "STOPLOSS_HIT"
+            }:
+                log.info("exit_fill_already_applied", signal_id=signal_id, order_id=order_id, status=signal_status)
+                return
 
             is_target_hit = False
             is_stoploss_hit = False
@@ -307,28 +331,86 @@ class OrderTracker:
         if pnl != 0:
             await self._pnl_guard.record(self._redis, self._pool, pnl)
 
+    async def _reconcile_gtt_payload(self, payload: dict) -> None:
+        gtt = payload
+        if isinstance(payload.get("data"), list) and payload["data"]:
+            gtt = payload["data"][0]
+
+        gtt_id = gtt.get("gtt_order_id") or gtt.get("gttOrderId") or gtt.get("id")
+        if not gtt_id:
+            return
+
+        rules = gtt.get("rules") or []
+        if not rules:
+            return
+
+        async with self._pool.acquire() as conn:
+            db_rules = await get_gtt_rules_by_gtt_order_id(conn, str(gtt_id))
+            if not db_rules:
+                return
+
+            signal_id = db_rules[0]["signal_id"]
+            for item in rules:
+                strategy = str(item.get("strategy", "")).upper()
+                await upsert_gtt_rule(conn, {
+                    "signal_id": signal_id,
+                    "gtt_order_id": str(gtt_id),
+                    "strategy": strategy,
+                    "trigger_type": item.get("trigger_type"),
+                    "trigger_price": item.get("trigger_price"),
+                    "transaction_type": item.get("transaction_type"),
+                    "status": item.get("status"),
+                    "order_id": item.get("order_id"),
+                    "message": item.get("message"),
+                    "payload_json": json.dumps(gtt),
+                })
+
+        for item in rules:
+            order_id = item.get("order_id")
+            rule_status = str(item.get("status", "")).lower()
+            if not order_id or rule_status not in _RULE_FILLED_STATUSES:
+                continue
+            await self._process_filled_order(str(order_id), {
+                "gttOrderId": str(gtt_id),
+                "transactionType": item.get("transaction_type"),
+                "status": "complete",
+            })
+
+    async def reconcile_open_gtts(self) -> None:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT unnest(gtt_order_ids) AS gtt_order_id
+                FROM signals
+                WHERE status = ANY($1::text[])
+                  AND gtt_order_ids IS NOT NULL
+                """,
+                list(_OPEN_SIGNAL_STATUSES),
+            )
+
+        for row in rows:
+            gtt_id = row["gtt_order_id"]
+            if not gtt_id:
+                continue
+            try:
+                payload = await self._upstox.get_gtt(str(gtt_id))
+                await self._reconcile_gtt_payload(payload)
+            except Exception as e:
+                log.warning("gtt_reconcile_failed", gtt_id=gtt_id, error=str(e))
+
+    async def reconciliation_loop(self, interval_seconds: int = 30) -> None:
+        while True:
+            try:
+                await self.reconcile_open_gtts()
+            except Exception as e:
+                log.warning("gtt_reconciliation_loop_failed", error=str(e))
+            await asyncio.sleep(interval_seconds)
+
     async def startup_backfill(self) -> None:
-        """Sync GTT state from Upstox on startup to handle events missed while offline."""
+        """Reconcile open GTTs on startup to catch fills missed while offline."""
         try:
-            resp = await self._upstox.get_all_gtts()
-            data = resp.get("data", [])
-            gtts = data if isinstance(data, list) else data.get("gtt_order_list", [])
-            for gtt in gtts:
-                gtt_id = gtt.get("id")
-                status = str(gtt.get("status", "")).lower()
-                if not gtt_id:
-                    continue
-                async with self._pool.acquire() as conn:
-                    rules = await get_gtt_rules_by_gtt_order_id(conn, str(gtt_id))
-                    for rule in rules:
-                        await upsert_gtt_rule(conn, {
-                            "signal_id": rule["signal_id"],
-                            "gtt_order_id": str(gtt_id),
-                            "strategy": rule["strategy"],
-                            "status": status,
-                            "payload_json": json.dumps(gtt),
-                        })
-            log.info("startup_backfill_done", gtt_count=len(gtts))
+            await self.reconcile_open_gtts()
+            log.info("startup_backfill_done")
         except Exception as e:
             log.warning("startup_backfill_failed", error=str(e))
 
@@ -355,9 +437,11 @@ async def main() -> None:
 
     writer_task = asyncio.create_task(db_writer.run())
     asyncio.create_task(heartbeat_loop())
+    reconcile_task = asyncio.create_task(tracker.reconciliation_loop())
     try:
         await ws.run()
     finally:
+        reconcile_task.cancel()
         await db_writer.stop()
         writer_task.cancel()
         await upstox.aclose()
